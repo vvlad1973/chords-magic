@@ -397,7 +397,13 @@ def build_gp5(
         h.start  = guitarpro.Duration.quarterTime * beats_per_bar * i + guitarpro.Duration.quarterTime
         h.timeSignature.numerator   = beats_per_bar
         h.timeSignature.denominator = guitarpro.Duration(4)
-        h.tempo.value = bpm
+        # Tempo is set globally on song.tempo; per-measure tempo not supported
+        # in all PyGuitarPro versions — skip to avoid AttributeError.
+        if hasattr(h, 'tempo') and h.tempo is not None:
+            try:
+                h.tempo.value = bpm
+            except AttributeError:
+                pass
         song.measureHeaders.append(h)
 
     track = song.tracks[0]
