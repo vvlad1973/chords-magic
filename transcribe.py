@@ -359,7 +359,7 @@ _GP_DURATIONS: list[tuple[int, guitarpro.Duration]] = sorted(
 
 def _snap_duration(gp_ticks: int) -> tuple[guitarpro.Duration, int]:
     """Return (Duration, actual_gp_ticks) closest to *gp_ticks*."""
-    best_dur, best_t = _GP_DURATIONS[-1]
+    best_t, best_dur = _GP_DURATIONS[-1]
     best_diff = abs(gp_ticks - best_t)
     for t, dur in _GP_DURATIONS:
         diff = abs(gp_ticks - t)
