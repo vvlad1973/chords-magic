@@ -544,8 +544,26 @@ def build_gp5(
 
         track.measures.append(measure)
 
-    guitarpro.write(song, str(output_path))
-    print(f"    → {output_path}")
+    # ── Write + verify ───────────────────────────────────────────────────────
+    # Try GP5, fall back to GP4 if Guitar Pro refuses to open it.
+    for suffix in (".gp5", ".gp4"):
+        out = output_path.with_suffix(suffix)
+        try:
+            guitarpro.write(song, str(out))
+            size = out.stat().st_size
+            if size < 64:
+                raise ValueError(f"Output file is suspiciously small ({size} B)")
+            # Verify: try reading it back with PyGuitarPro
+            guitarpro.parse(str(out))
+            print(f"    → {out}  ({size:,} bytes, verified ✓)")
+            output_path = out
+            break
+        except Exception as exc:
+            print(f"    ✗ {suffix} failed ({exc}), trying next format …")
+            if out.exists():
+                out.unlink()
+    else:
+        raise RuntimeError("Could not write a valid Guitar Pro file.")
 
 
 # ─── Orchestration ────────────────────────────────────────────────────────────
