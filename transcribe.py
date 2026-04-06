@@ -546,7 +546,14 @@ def build_gp5(
 
     # ── Write + verify ───────────────────────────────────────────────────────
     # Try GP5, fall back to GP4 if Guitar Pro refuses to open it.
-    for suffix in (".gp5", ".gp4"):
+    # Try formats from newest to oldest for maximum compatibility.
+    # .gp  = GP7/8 native (Guitar Pro 8 opens this best)
+    # .gpx = GP6
+    # .gp5 = GP5
+    # .gp4 = GP4 (simplest, most universally readable)
+    preferred = output_path.suffix.lower()
+    suffixes  = [preferred] + [s for s in (".gp", ".gpx", ".gp5", ".gp4") if s != preferred]
+    for suffix in suffixes:
         out = output_path.with_suffix(suffix)
         try:
             guitarpro.write(song, str(out))
@@ -714,7 +721,7 @@ Examples:
     if not input_path.exists():
         sys.exit(f"Error: file not found — {input_path}")
 
-    output_path = (args.output or input_path.with_suffix(".gp5")).resolve()
+    output_path = (args.output or input_path.with_suffix(".gp")).resolve()
     work_dir    = (args.work_dir or Path("work")).resolve()
     stems_dir   = (args.stems_dir or work_dir / "stems").resolve()
     midi_dir    = (args.midi_dir  or work_dir / "midi").resolve()
