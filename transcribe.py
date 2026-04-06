@@ -140,6 +140,15 @@ def audio_to_midi(
     from basic_pitch.inference import predict_and_save
     from basic_pitch import ICASSP_2022_MODEL_PATH
 
+    # basic-pitch skips (not overwrites) existing files — remove them first
+    expected = midi_dir / f"{guitar_wav.stem}_basic_pitch.mid"
+    if expected.exists():
+        expected.unlink()
+        print(f"    Removed existing {expected.name}")
+    # Also remove any other .mid files in the dir to avoid picking up stale ones
+    for f in midi_dir.glob("*.mid"):
+        f.unlink()
+
     predict_and_save(
         audio_path_list=[str(guitar_wav)],
         output_directory=str(midi_dir),
