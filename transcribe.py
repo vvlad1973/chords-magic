@@ -332,25 +332,57 @@ def assign_positions(notes: list[dict]) -> list[dict]:
 
 
 # ─── Step 6: MIDI → Guitar Pro ───────────────────────────────────────────────
+#
+# Guitar Pro internally uses quarterTime=960 ticks per beat, independent of
+# the MIDI file's ticks_per_beat.  Every voice MUST contain beats whose
+# durations sum to EXACTLY one measure.  Violations produce garbage output.
+#
+# Fixes vs previous version:
+#   1. All timings converted from MIDI ticks → GP ticks (scale = 960 / tpb).
+#   2. Simultaneous notes grouped into chords (one Beat with many Notes).
+#   3. Gaps before notes and the tail of each measure filled with exact rests.
+# ─────────────────────────────────────────────────────────────────────────────
 
-def ticks_to_gp_duration(ticks: int, tpb: int) -> guitarpro.Duration:
-    """Nearest Guitar Pro Duration to *ticks* (including dotted values)."""
-    beat = tpb
-    best_dur  = guitarpro.Duration(4)
-    best_diff = abs(ticks - beat)
-    for value in (1, 2, 4, 8, 16, 32, 64):
-        note_ticks = int(beat * 4 / value)
-        for factor, dotted in ((1, False), (1.5, True)):
-            t = int(note_ticks * factor)
-            diff = abs(ticks - t)
-            if diff < best_diff:
-                best_diff = diff
-                best_dur  = guitarpro.Duration(value, isDotted=dotted)
-    return best_dur
+_GP_TPB = guitarpro.Duration.quarterTime  # 960 GP ticks per beat
+
+# Pre-sorted list of (gp_ticks, Duration) from largest to smallest.
+# Used for greedy rest-fill and duration snapping.
+_GP_DURATIONS: list[tuple[int, guitarpro.Duration]] = sorted(
+    [
+        (int(_GP_TPB * 4 / v * f), guitarpro.Duration(v, isDotted=(f != 1)))
+        for v in (1, 2, 4, 8, 16, 32, 64)
+        for f in (1, 1.5)
+    ],
+    reverse=True,
+)
 
 
-def load_midi_notes(midi_path: Path) -> tuple[list[dict], int, int]:
-    """Parse MIDI → (notes, tpb, bpm).  Notes filtered to guitar range."""
+def _snap_duration(gp_ticks: int) -> tuple[guitarpro.Duration, int]:
+    """Return (Duration, actual_gp_ticks) closest to *gp_ticks*."""
+    best_dur, best_t = _GP_DURATIONS[-1]
+    best_diff = abs(gp_ticks - best_t)
+    for t, dur in _GP_DURATIONS:
+        diff = abs(gp_ticks - t)
+        if diff < best_diff:
+            best_diff, best_dur, best_t = diff, dur, t
+    return best_dur, best_t
+
+
+def _fill_rests(voice, gp_ticks: int) -> None:
+    """Append rest Beats to *voice* summing to exactly *gp_ticks* GP ticks."""
+    remaining = gp_ticks
+    for t, dur in _GP_DURATIONS:
+        while remaining >= t:
+            rest = guitarpro.Beat(voice)
+            rest.status   = guitarpro.BeatStatus.rest
+            rest.duration = dur
+            voice.beats.append(rest)
+            remaining -= t
+    # Any sub-64th residual is silently dropped (< 60 GP ticks ≈ 1/64 note).
+
+
+def load_midi_notes(midi_path: Path) -> tuple[list[dict], int, int, int]:
+    """Parse MIDI → (notes, tpb, bpm, tempo_us).  Notes filtered to guitar range."""
     mid = mido.MidiFile(str(midi_path))
     tpb = mid.ticks_per_beat
     tempo_us = 500_000
@@ -372,7 +404,7 @@ def load_midi_notes(midi_path: Path) -> tuple[list[dict], int, int]:
                         notes.append({
                             "pitch": msg.note,
                             "start": start,
-                            "end": tick,
+                            "end":   tick,
                             "velocity": vel,
                         })
 
@@ -386,37 +418,61 @@ def build_gp5(
     bpm: int,
     output_path: Path,
 ) -> None:
-    """Write a Guitar Pro 5 file from positioned notes."""
-    beats_per_bar   = 4
-    ticks_per_bar   = tpb * beats_per_bar
+    """
+    Construct a Guitar Pro 5 file from fretboard-positioned notes.
 
-    if notes_with_pos:
-        last_tick = max(n["end"] for n in notes_with_pos)
-        num_measures = max(1, int(np.ceil(last_tick / ticks_per_bar)))
+    Pipeline:
+      1. Convert MIDI ticks → GP ticks  (scale = _GP_TPB / tpb).
+      2. Group notes that share the same GP tick → chords.
+      3. For each measure: fill gaps + trailing space with exact rests so
+         every voice sums to exactly one bar.
+    """
+    from collections import defaultdict
+
+    beats_per_bar     = 4
+    GP_TICKS_PER_BAR  = _GP_TPB * beats_per_bar   # 3840 for 4/4
+
+    # ── 1. Convert timings to GP ticks ──────────────────────────────────────
+    scale = _GP_TPB / tpb
+    gp_notes = []
+    for nd in notes_with_pos:
+        gs = round(nd["start"] * scale)
+        ge = round(nd["end"]   * scale)
+        ge = max(ge, gs + 60)   # minimum 64th note
+        gp_notes.append({**nd, "gs": gs, "ge": ge})
+
+    # ── 2. Group simultaneous notes (same GP tick = chord) ──────────────────
+    by_tick: dict[int, list[dict]] = defaultdict(list)
+    for nd in gp_notes:
+        by_tick[nd["gs"]].append(nd)
+
+    # ── 3. Measure count ─────────────────────────────────────────────────────
+    if gp_notes:
+        last_gp_tick  = max(nd["ge"] for nd in gp_notes)
+        num_measures  = max(1, int(np.ceil(last_gp_tick / GP_TICKS_PER_BAR)))
     else:
         num_measures = 1
 
-    song = guitarpro.Song()
+    # ── Song / track skeleton ────────────────────────────────────────────────
+    song       = guitarpro.Song()
     song.tempo = bpm
 
     song.measureHeaders = []
     for i in range(num_measures):
-        h = guitarpro.MeasureHeader()
+        h        = guitarpro.MeasureHeader()
         h.number = i + 1
-        h.start  = guitarpro.Duration.quarterTime * beats_per_bar * i + guitarpro.Duration.quarterTime
+        h.start  = _GP_TPB * beats_per_bar * i + _GP_TPB
         h.timeSignature.numerator   = beats_per_bar
         h.timeSignature.denominator = guitarpro.Duration(4)
-        # Tempo is set globally on song.tempo; per-measure tempo not supported
-        # in all PyGuitarPro versions — skip to avoid AttributeError.
-        if hasattr(h, 'tempo') and h.tempo is not None:
+        if hasattr(h, "tempo") and h.tempo is not None:
             try:
                 h.tempo.value = bpm
             except AttributeError:
                 pass
         song.measureHeaders.append(h)
 
-    track = song.tracks[0]
-    track.name = "Guitar Solo"
+    track                  = song.tracks[0]
+    track.name             = "Guitar Solo"
     track.isPercussionTrack = False
     track.strings = [
         guitarpro.GuitarString(number=i + 1, value=v)
@@ -424,45 +480,67 @@ def build_gp5(
     ]
     track.fretCount = MAX_FRET
 
+    # ── Build measures ────────────────────────────────────────────────────────
     track.measures = []
     for mi in range(num_measures):
-        bar_start = mi * ticks_per_bar
-        bar_end   = bar_start + ticks_per_bar
+        bar_start = mi * GP_TICKS_PER_BAR
+        bar_end   = bar_start + GP_TICKS_PER_BAR
 
-        measure = guitarpro.Measure(track, song.measureHeaders[mi])
-        voice   = measure.voices[0]
-        voice.beats = []
+        measure       = guitarpro.Measure(track, song.measureHeaders[mi])
+        voice         = measure.voices[0]
+        voice.beats   = []
 
-        bar_notes = [n for n in notes_with_pos if bar_start <= n["start"] < bar_end]
+        # Note groups that start inside this bar
+        bar_ticks = sorted(t for t in by_tick if bar_start <= t < bar_end)
 
-        if not bar_notes:
-            rest          = guitarpro.Beat(voice)
-            rest.status   = guitarpro.BeatStatus.rest
-            rest.duration = guitarpro.Duration(1)
-            voice.beats.append(rest)
+        if not bar_ticks:
+            _fill_rests(voice, GP_TICKS_PER_BAR)
         else:
-            cursor = bar_start
-            for nd in bar_notes:
-                gap = nd["start"] - cursor
-                if gap >= tpb // 8:
-                    rest          = guitarpro.Beat(voice)
-                    rest.status   = guitarpro.BeatStatus.rest
-                    rest.duration = ticks_to_gp_duration(gap, tpb)
-                    voice.beats.append(rest)
+            cursor = bar_start   # tracks current GP position inside the bar
 
-                dur_ticks     = max(nd["end"] - nd["start"], tpb // 16)
-                beat          = guitarpro.Beat(voice)
-                beat.status   = guitarpro.BeatStatus.normal
-                beat.duration = ticks_to_gp_duration(dur_ticks, tpb)
+            for tick in bar_ticks:
+                # Fill gap before this beat with rests
+                gap = tick - cursor
+                if gap > 0:
+                    _fill_rests(voice, gap)
 
-                gp_note          = guitarpro.Note(beat)
-                gp_note.string   = nd["string"]
-                gp_note.fret     = nd["fret"]
-                gp_note.velocity = min(127, nd["velocity"])
-                beat.notes.append(gp_note)
+                group      = by_tick[tick]
+                available  = bar_end - tick   # GP ticks left in bar
+
+                # Beat duration = shortest note in chord, capped by bar end
+                note_dur_ticks = min(nd["ge"] - nd["gs"] for nd in group)
+                note_dur_ticks = max(note_dur_ticks, 60)          # ≥ 64th
+                note_dur_ticks = min(note_dur_ticks, available)
+
+                gp_dur, actual_ticks = _snap_duration(note_dur_ticks)
+
+                # Ensure we never exceed the bar
+                if actual_ticks > available:
+                    # Fall back to the largest duration that fits
+                    for t, dur in _GP_DURATIONS:
+                        if t <= available:
+                            gp_dur, actual_ticks = dur, t
+                            break
+
+                # Build beat (one Beat = one or more Notes sharing start tick)
+                beat        = guitarpro.Beat(voice)
+                beat.status = guitarpro.BeatStatus.normal
+                beat.duration = gp_dur
+
+                for nd in group:
+                    gp_note          = guitarpro.Note(beat)
+                    gp_note.string   = nd["string"]
+                    gp_note.fret     = nd["fret"]
+                    gp_note.velocity = min(127, nd["velocity"])
+                    beat.notes.append(gp_note)
+
                 voice.beats.append(beat)
+                cursor = tick + actual_ticks
 
-                cursor = nd["end"]
+            # Fill remaining bar tail with rests
+            tail = bar_end - cursor
+            if tail > 0:
+                _fill_rests(voice, tail)
 
         track.measures.append(measure)
 
